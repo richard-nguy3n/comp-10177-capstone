@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.tar
+*.env
+*.dump
+*.key
+ansible/secrets*

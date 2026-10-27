@@ -1,0 +1,30 @@
+---
+- name: Maintain application server baseline
+  hosts: apps
+  become: true
+
+  tasks:
+    - name: Set FW01 as a time source
+      ansible.builtin.lineinfile:
+        path: /etc/chrony.conf
+        line: "server 192.168.20.1 iburst"
+        state: present
+      notify: Restart chronyd
+
+    - name: Enable and start baseline services
+      ansible.builtin.service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - sshd
+        - firewalld
+        - chronyd
+        - rsyslog
+        - vmtoolsd
+
+  handlers:
+    - name: Restart chronyd
+      ansible.builtin.service:
+        name: chronyd
+        state: restarted
