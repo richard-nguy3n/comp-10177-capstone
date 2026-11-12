@@ -1,26 +1,26 @@
 ---
-- name: Maintain application server baseline
+- name: Maintain application server baseline                #run the baseline on app01-02 with admin right 
   hosts: apps
   become: true
 
   tasks:
-    - name: Set FW01 as a time source
+    - name: Set FW01 as a time source               # set the app time source D
       ansible.builtin.lineinfile:
         path: /etc/chrony.conf
         line: "server 192.168.20.1 iburst"
         state: present
       notify: Restart chronyd
 
-    - name: Enable and start baseline services
+    - name: Enable and start baseline services          # make the service start and turn on automatically 
       ansible.builtin.service:
         name: "{{ item }}"
         enabled: true
         state: started
-      loop:
+      loop:                                       # list of service that apply 
         - sshd
         - firewalld
-        - chronyd
-        - rsyslog
+        - chronyd                                # kêep the server clock right , syncing all with a time source 
+        - rsyslog                                # collects and manage  sys log 
         - vmtoolsd
 
   handlers:
