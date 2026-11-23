@@ -1,30 +1,202 @@
 ---
-- name: Maintain application server baseline                #run the baseline on app01-02 with admin right 
+# Run the same baseline on APP01 and APP02.
+- name: Maintain application server baseline
   hosts: apps
+
+  # Use sudo for tasks that need administrator access.
   become: true
 
+  # Define the lists used by the tasks below.
+  vars:
+
+    # Required software:
+    # podman: runs the portal container.
+    # firewalld: controls the server's firewall.
+    # rsyslog: collects and forwards logs.
+    # chrony: synchronizes the server clock.
+    # python3: supports Ansible modules on the server.
+    # openssh-server: provides SSH access.
+    # open-vm-tools: supports integration with VMware.
+    baseline_packages:
+      - podman
+      - firewalld
+      - rsyslog
+      - chrony
+      - python3
+      - openssh-server
+      - open-vm-tools
+
+    # Services that should be running and start after a reboot.
+    baseline_services:
+      - sshd
+      - firewalld
+      - chronyd
+      - rsyslog
+      - vmtoolsd
+
+    # Maintain the existing inbound firewall permissions.
+    # These rules apply to the public zone used by both app servers.
+    # Other existing firewall rules are preserved.
+    baseline_rules:
+
+      # Allow management-network devices to connect through SSH.
+      - 'rule family="ipv4" source address="192.168.30.0/24" port port="22" protocol="tcp" accept'
+
+      # Allow MGMT01 to test the portal directly on port 8080.
+      - 'rule family="ipv4" source address="192.168.30.10/32" port port="8080" protocol="tcp" accept'
+
+      # Allow HAProxy on FW01 to reach the portal on port 8080.
+      - 'rule family="ipv4" source address="192.168.20.1/32" port port="8080" protocol="tcp" accept'
+
   tasks:
-    - name: Set FW01 as a time source               # set the app time source D
+
+    # Install missing packages.
+    # state: present keeps installed packages in place without
+    # requesting an upgrade to the newest version.
+    - name: Install runtime and baseline packages
+      ansible.builtin.dnf:
+        name: "{{ baseline_packages }}"
+        state: present
+
+    # Create an operations service account if it does not exist.
+    # /sbin/nologin prevents interactive login.
+    # No home directory is needed for this account.
+    # This is separate from the account Ansible uses to connect.
+    - name: Maintain operations service account
+      ansible.builtin.user:
+        name: opssvc
+        shell: /sbin/nologin
+        create_home: false
+        state: present
+
+    # Ensure Chrony has an entry for FW01 as a time source.
+    # This preserves other existing time-source entries.
+    # Restart Chrony only if this task changes the file.
+    - name: Set FW01 as a time source
       ansible.builtin.lineinfile:
         path: /etc/chrony.conf
         line: "server 192.168.20.1 iburst"
         state: present
       notify: Restart chronyd
 
-    - name: Enable and start baseline services          # make the service start and turn on automatically 
+    # Process every service in baseline_services.
+    # enabled: true means start automatically after reboot.
+    # state: started means make sure it is running now.
+    - name: Enable and start baseline services
       ansible.builtin.service:
         name: "{{ item }}"
         enabled: true
         state: started
-      loop:                                       # list of service that apply 
-        - sshd
-        - firewalld
-        - chronyd                                # kêep the server clock right , syncing all with a time source 
-        - rsyslog                                # collects and manage  sys log 
-        - vmtoolsd
+      loop: "{{ baseline_services }}"
 
+    # Check whether each rule exists in the saved firewall settings.
+    # Saved rules are used after a firewall reload or reboot.
+    # register stores the results for the following task.
+    # Return code 0 means present; 1 means missing.
+    # Reading a rule does not count as a configuration change.
+    - name: Check permanent firewall rules
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --permanent
+          - --zone=public
+          - "--query-rich-rule={{ item }}"
+      loop: "{{ baseline_rules }}"
+      register: permanent_rules
+      changed_when: false
+      failed_when: permanent_rules.rc not in [0, 1]
+
+    # Add only the saved rules found to be missing.
+    # Existing rules are left in place.
+    # item.item contains the rule from the earlier check.
+    - name: Add missing permanent firewall rules
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --permanent
+          - --zone=public
+          - "--add-rich-rule={{ item.item }}"
+      loop: "{{ permanent_rules.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc == 1
+
+    # Check the firewall rules currently active in memory.
+    # A saved rule may exist even when its runtime copy is missing,
+    # so we check both saved and active settings.
+    - name: Check runtime firewall rules
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --zone=public
+          - "--query-rich-rule={{ item }}"
+      loop: "{{ baseline_rules }}"
+      register: runtime_rules
+      changed_when: false
+      failed_when: runtime_rules.rc not in [0, 1]
+
+    # Add missing rules to the running firewall immediately.
+    # This avoids reloading the whole firewall.
+    - name: Add missing runtime firewall rules
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --zone=public
+          - "--add-rich-rule={{ item.item }}"
+      loop: "{{ runtime_rules.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc == 1
+
+    # Copy the log-forwarding template from MGMT01 to each app.
+    # Root owns the file; other users can read it.
+    # Keep a backup if an existing file is replaced.
+    # If the file changes, validate rsyslog and then restart it.
+    - name: Configure centralized log forwarding
+      ansible.builtin.template:
+        src: templates/60-forward.conf.j2
+        dest: /etc/rsyslog.d/60-forward.conf
+        owner: root
+        group: root
+        mode: '0644'
+        backup: true
+      notify:
+        - Validate rsyslog configuration
+        - Restart rsyslog
+
+    # Create a harmless file with a defined value.
+    # Later, we can change this file manually on APP02 and rerun
+    # Ansible to demonstrate automatic configuration correction.
+    - name: Maintain baseline marker
+      ansible.builtin.copy:
+        content: "Managed by capstone Ansible baseline\n"
+        dest: /etc/capstone-baseline.txt
+        owner: root
+        group: root
+        mode: '0644'
+
+  # Handlers run near the end of the play, only when notified
+  # by a task that changed something.
+  # They execute in the order listed here.
   handlers:
+
+    # Apply a changed time-source configuration.
     - name: Restart chronyd
       ansible.builtin.service:
         name: chronyd
+        state: restarted
+
+    # Check the complete rsyslog configuration before restarting.
+    # If validation fails, Ansible stops before the restart.
+    - name: Validate rsyslog configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/rsyslogd
+          - -N1
+      changed_when: false
+
+    # Apply the updated logging configuration after validation.
+    - name: Restart rsyslog
+      ansible.builtin.service:
+        name: rsyslog
         state: restarted
