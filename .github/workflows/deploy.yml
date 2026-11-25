@@ -1,0 +1,58 @@
+name: Capstone deployment
+
+# Run after a push to master, or start manually from GitHub.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Allow only one deployment at a time.
+concurrency:
+  group: capstone-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, x64, capstone]
+    timeout-minutes: 30
+
+    steps:
+      # Download this commit into the runner's working folder.
+      - name: Get project code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Give every build a unique tag and embedded version.
+      - name: Build portal image
+        run: |
+          podman build \
+            --build-arg APP_VERSION="$GITHUB_SHA" \
+            -t "localhost/opsportal:$GITHUB_SHA" .
+
+      # Test before allowing deployment.
+      - name: Test portal code
+        run: |
+          podman run --rm \
+            -v "$PWD:/project:ro,Z" \
+            -w /project \
+            --entrypoint python \
+            "localhost/opsportal:$GITHUB_SHA" \
+            -m pytest tests/ -q -p no:cacheprovider
+
+      - name: Export portal image
+        run: |
+          podman save \
+            -o "$RUNNER_TEMP/opsportal-$GITHUB_SHA.tar" \
+            "localhost/opsportal:$GITHUB_SHA"
+
+      # Reuse our tested deployment and automatic rollback script.
+      - name: Deploy one APP at a time
+        run: |
+          bash tools/rollout.sh deploy \
+            "localhost/opsportal:$GITHUB_SHA" \
+            "$RUNNER_TEMP/opsportal-$GITHUB_SHA.tar" \
+            "$GITHUB_SHA"
