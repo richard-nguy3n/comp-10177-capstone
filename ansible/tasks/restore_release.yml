@@ -1,0 +1,64 @@
+---
+# Restore the exact Quadlet saved at transaction start. Preserve networking,
+# environment-file settings and other options from the working configuration.
+- name: Read previous image reference
+  ansible.builtin.slurp:
+    src: /etc/opsportal/previous-image
+  register: restore_ref
+
+- name: Read saved previous Quadlet privately
+  ansible.builtin.slurp:
+    src: /etc/opsportal/previous.container
+  register: restore_unit
+  no_log: true
+
+- name: Validate the saved Quadlet belongs to the previous image
+  ansible.builtin.assert:
+    that:
+      - >-
+        ((restore_unit.content | b64decode)
+          | regex_findall('(?m)^Image=(.+)$') | map('trim') | list)
+        == [restore_ref.content | b64decode | trim]
+  no_log: true
+
+- name: Restore the saved Quadlet
+  ansible.builtin.copy:
+    src: /etc/opsportal/previous.container
+    remote_src: true
+    dest: /etc/containers/systemd/opsportal.container
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Restart this restored node
+  ansible.builtin.systemd:
+    name: opsportal
+    daemon_reload: true
+    state: restarted
+
+- name: Verify the restored image ID and version
+  ansible.builtin.include_tasks: verify_release.yml
+  vars:
+    verify_ref: '{{ restore_ref.content | b64decode | trim }}'
+
+# Manual's HAProxy reference uses 2-second checks and rise=2.
+- name: Allow backend health checks to recover
+  ansible.builtin.pause:
+    seconds: 8
+
+- name: Check trusted HTTPS from MGMT01
+  ansible.builtin.uri:
+    url: https://portal.opsdemo.test/health
+    validate_certs: true
+    status_code: 200
+    timeout: 10
+  delegate_to: localhost
+  become: false
+
+- name: Record the restored image only after successful verification
+  ansible.builtin.copy:
+    content: '{{ restore_ref.content | b64decode }}'
+    dest: /etc/opsportal/image
+    owner: root
+    group: root
+    mode: '0644'

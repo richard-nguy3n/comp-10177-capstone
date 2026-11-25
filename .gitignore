@@ -9,3 +9,7 @@ __pycache__
 ansible/secrets*
 
 /evidence/
+
+# Local rollout files
+.rollout.lock
+ansible/baseline.yml.before-*

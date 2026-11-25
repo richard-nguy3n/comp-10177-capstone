@@ -1,0 +1,222 @@
+---
+# Preflight changes no running service. Snapshot rollback references only after
+# BOTH nodes are verified and the controller's new image/archive are available.
+- name: Verify the starting state and preserve rollback configuration
+  hosts: apps
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require deployment inputs
+      ansible.builtin.assert:
+        that:
+          - image_ref is defined
+          - image_archive is defined
+          - release_version is defined
+          - transaction_marker is defined
+      run_once: true
+
+    - name: Read accepted image reference
+      ansible.builtin.slurp:
+        src: /etc/opsportal/image
+      register: accepted_ref
+
+    - name: Verify the currently accepted release
+      ansible.builtin.include_tasks: tasks/verify_release.yml
+      vars:
+        verify_ref: '{{ accepted_ref.content | b64decode | trim }}'
+
+    - name: Remember transaction-start identity
+      ansible.builtin.set_fact:
+        start_ref: '{{ checked_ref }}'
+        start_id: '{{ checked_id }}'
+        start_version: '{{ checked_versions[0] }}'
+
+    - name: Read the original Quadlet privately
+      ansible.builtin.slurp:
+        src: /etc/containers/systemd/opsportal.container
+      register: original_unit
+      no_log: true
+
+    - name: Require one Image line matching the accepted image
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((original_unit.content | b64decode)
+              | regex_findall('(?m)^Image=(.+)$') | map('trim') | list)
+            == [start_ref]
+      no_log: true
+
+    - name: Require identical healthy starting releases on both apps
+      ansible.builtin.assert:
+        that:
+          - hostvars['APP01'].start_ref == hostvars['APP02'].start_ref
+          - hostvars['APP01'].start_id == hostvars['APP02'].start_id
+          - hostvars['APP01'].start_version == hostvars['APP02'].start_version
+          - image_ref != start_ref
+        fail_msg: Both nodes must start on one identical release; use a new image tag.
+      run_once: true
+
+    - name: Check the new archive on MGMT01
+      ansible.builtin.stat:
+        path: '{{ image_archive }}'
+      register: release_archive
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Require a nonempty release archive
+      ansible.builtin.assert:
+        that:
+          - release_archive.stat.exists
+          - release_archive.stat.isreg
+          - release_archive.stat.size > 0
+      run_once: true
+
+    - name: Inspect the controller image as the invoking user
+      ansible.builtin.command:
+        argv: [podman, image, inspect, '{{ image_ref }}']
+      register: controller_image
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Validate the controller release version
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((controller_image.stdout | from_json)[0].Config.Env
+              | select('match', '^APP_VERSION=') | list)
+            == ['APP_VERSION=' ~ release_version]
+      run_once: true
+
+    - name: Record expected new image identity on each host
+      ansible.builtin.set_fact:
+        release_id: '{{ (controller_image.stdout | from_json)[0].Id }}'
+
+    - name: Verify trusted portal health before any restart
+      ansible.builtin.uri:
+        url: https://portal.opsdemo.test/health
+        validate_certs: true
+        status_code: 200
+        timeout: 10
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Preserve previous Quadlet without changing the live file
+      ansible.builtin.copy:
+        content: '{{ original_unit.content | b64decode }}'
+        dest: /etc/opsportal/previous.container
+        owner: root
+        group: root
+        mode: '0600'
+      no_log: true
+
+    - name: Preserve previous image reference
+      ansible.builtin.copy:
+        content: '{{ accepted_ref.content | b64decode }}'
+        dest: /etc/opsportal/previous-image
+        owner: root
+        group: root
+        mode: '0600'
+
+    # The wrapper may roll back only if this complete preflight succeeded.
+    - name: Mark completed preflight on MGMT01
+      ansible.builtin.copy:
+        content: "Preflight passed; rollback snapshots are ready.\n"
+        dest: '{{ transaction_marker }}'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+- name: Deploy APP01 then APP02
+  hosts: apps
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Deploy and validate one node
+      block:
+        - name: Transfer release archive
+          ansible.builtin.copy:
+            src: '{{ image_archive }}'
+            dest: /var/tmp/opsportal-release.tar
+            mode: '0600'
+
+        - name: Load the image into rootful Podman
+          ansible.builtin.command:
+            argv: [podman, load, -i, /var/tmp/opsportal-release.tar]
+
+        - name: Inspect the loaded image
+          ansible.builtin.command:
+            argv: [podman, image, inspect, '{{ image_ref }}']
+          register: loaded_image
+          changed_when: false
+
+        - name: Require the archive to contain the intended image
+          ansible.builtin.assert:
+            that:
+              - (loaded_image.stdout | from_json)[0].Id == release_id
+
+        # Change only Image=. Keep the working environment and network options.
+        - name: Select the new image in the existing Quadlet
+          ansible.builtin.lineinfile:
+            path: /etc/containers/systemd/opsportal.container
+            regexp: '^Image='
+            line: 'Image={{ image_ref }}'
+            backrefs: true
+
+        - name: Restart only the current application node
+          ansible.builtin.systemd:
+            name: opsportal
+            daemon_reload: true
+            state: restarted
+
+        - name: Verify the running image and exact application version
+          ansible.builtin.include_tasks: tasks/verify_release.yml
+          vars:
+            verify_ref: '{{ image_ref }}'
+
+        - name: Allow HAProxy rise checks before proceeding
+          ansible.builtin.pause:
+            seconds: 8
+
+        - name: Check trusted portal access from MGMT01
+          ansible.builtin.uri:
+            url: https://portal.opsdemo.test/health
+            validate_certs: true
+            status_code: 200
+            timeout: 10
+          delegate_to: localhost
+          become: false
+
+        - name: Record the accepted release
+          ansible.builtin.copy:
+            content: "{{ image_ref }}\n"
+            dest: /etc/opsportal/image
+            owner: root
+            group: root
+            mode: '0644'
+
+      rescue:
+        - name: Restore and verify the failed node
+          ansible.builtin.include_tasks: tasks/restore_release.yml
+
+        - name: Reject the release and trigger whole-transaction rollback
+          ansible.builtin.fail:
+            msg: Release rejected. The wrapper will restore both transaction-start releases.
+
+- name: Confirm the complete new release
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Require both nodes to run the same intended image and version
+      ansible.builtin.assert:
+        that:
+          - hostvars['APP01'].checked_id == hostvars['APP02'].checked_id
+          - hostvars['APP01'].checked_id == hostvars['APP01'].release_id
+          - hostvars['APP01'].checked_versions[0] == release_version
+          - hostvars['APP02'].checked_versions[0] == release_version

@@ -1,0 +1,69 @@
+---
+# Validate both saved snapshots before restarting either server.
+- name: Validate transaction-start rollback data
+  hosts: apps
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Read saved image reference
+      ansible.builtin.slurp:
+        src: /etc/opsportal/previous-image
+      register: rollback_ref
+
+    - name: Read saved Quadlet privately
+      ansible.builtin.slurp:
+        src: /etc/opsportal/previous.container
+      register: rollback_unit
+      no_log: true
+
+    - name: Inspect the retained image
+      ansible.builtin.command:
+        argv: [podman, image, inspect, '{{ rollback_ref.content | b64decode | trim }}']
+      register: rollback_image
+      changed_when: false
+
+    - name: Require each saved Quadlet to match its retained image
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((rollback_unit.content | b64decode)
+              | regex_findall('(?m)^Image=(.+)$') | map('trim') | list)
+            == [rollback_ref.content | b64decode | trim]
+      no_log: true
+
+    - name: Require both nodes to share the same rollback image
+      ansible.builtin.assert:
+        that:
+          - hostvars['APP01'].rollback_ref.content == hostvars['APP02'].rollback_ref.content
+          - >-
+            (hostvars['APP01'].rollback_image.stdout | from_json)[0].Id ==
+            (hostvars['APP02'].rollback_image.stdout | from_json)[0].Id
+      run_once: true
+
+- name: Restore APP01 then APP02
+  hosts: apps
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Restore the previous complete configuration and verify it
+      ansible.builtin.include_tasks: tasks/restore_release.yml
+
+- name: Verify complete transaction rollback
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Require identical previous references identities and versions
+      ansible.builtin.assert:
+        that:
+          - hostvars['APP01'].checked_ref == hostvars['APP02'].checked_ref
+          - hostvars['APP01'].checked_id == hostvars['APP02'].checked_id
+          - hostvars['APP01'].checked_versions == hostvars['APP02'].checked_versions
+
+    - name: Check final trusted HTTPS health
+      ansible.builtin.uri:
+        url: https://portal.opsdemo.test/health
+        validate_certs: true
+        status_code: 200
+        timeout: 10

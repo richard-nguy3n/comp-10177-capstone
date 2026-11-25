@@ -1,0 +1,3 @@
+FROM localhost/opsportal:manual2
+ENV APP_VERSION=bad1
+COPY Containerfile.bad1 /app/UNHEALTHY

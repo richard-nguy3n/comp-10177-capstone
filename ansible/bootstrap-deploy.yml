@@ -1,0 +1,51 @@
+---
+- name: Prepare deployment access on both app servers
+  hosts: apps
+  become: true
+
+  tasks:
+    # Create the account that automated deployments will use.
+    - name: Create deployment account
+      ansible.builtin.user:
+        name: labdeploy
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    # Only labdeploy can access its SSH directory.
+    - name: Create SSH directory
+      ansible.builtin.file:
+        path: /home/labdeploy/.ssh
+        state: directory
+        owner: labdeploy
+        group: labdeploy
+        mode: '0700'
+
+    # Copy only the public key. The private key stays on MGMT01.
+    - name: Install deployment public key
+      ansible.builtin.copy:
+        src: /home/labadmin/.ssh/capstone_ed25519.pub
+        dest: /home/labdeploy/.ssh/authorized_keys
+        owner: labdeploy
+        group: labdeploy
+        mode: '0600'
+
+    # Set the SELinux labels required for SSH to read these files.
+    - name: Restore SSH security labels
+      ansible.builtin.command:
+        argv:
+          - restorecon
+          - -RF
+          - /home/labdeploy/.ssh
+      changed_when: false
+
+    # Allow unattended administration in this capstone lab.
+    # Validate the sudo rule before installing it.
+    - name: Configure deployment sudo access
+      ansible.builtin.copy:
+        content: "labdeploy ALL=(root) NOPASSWD: ALL\n"
+        dest: /etc/sudoers.d/labdeploy
+        owner: root
+        group: root
+        mode: '0440'
+        validate: '/usr/sbin/visudo -cf %s'

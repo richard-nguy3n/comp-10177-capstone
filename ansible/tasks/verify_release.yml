@@ -1,0 +1,57 @@
+---
+# Caller supplies verify_ref. Verify the actual image and database-aware health,
+# rather than trusting a tag or an HTTP 200 response alone.
+- name: Inspect the expected retained image
+  ansible.builtin.command:
+    argv: [podman, image, inspect, '{{ verify_ref }}']
+  register: checked_image
+  changed_when: false
+
+- name: Read image identity and embedded version
+  ansible.builtin.set_fact:
+    checked_ref: '{{ verify_ref }}'
+    checked_id: '{{ (checked_image.stdout | from_json)[0].Id }}'
+    checked_versions: >-
+      {{ (checked_image.stdout | from_json)[0].Config.Env
+         | select('match', '^APP_VERSION=')
+         | map('regex_replace', '^APP_VERSION=', '') | list }}
+
+- name: Require exactly one embedded application version
+  ansible.builtin.assert:
+    that:
+      - checked_versions | length == 1
+      - checked_versions[0] | length > 0
+
+# Container inspection includes database environment variables: hide its output.
+- name: Inspect the running portal container privately
+  ansible.builtin.command:
+    argv: [podman, container, inspect, opsportal]
+  register: checked_container
+  changed_when: false
+  no_log: true
+
+- name: Require the actual running image to match
+  ansible.builtin.assert:
+    that:
+      - (checked_container.stdout | from_json)[0].State.Running
+      - (checked_container.stdout | from_json)[0].Image == checked_id
+    fail_msg: Running container does not match the expected image.
+  no_log: true
+
+- name: Check database-aware local health and exact version
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8080/health
+    return_content: true
+    status_code: 200
+    timeout: 5
+  register: checked_health
+  until: >-
+    (checked_health.status | default(0)) == 200 and
+    (checked_health.json | default({})).get('version', '') == checked_versions[0] and
+    (checked_health.json | default({})).get('node', '') == inventory_hostname
+  retries: 15
+  delay: 2
+
+- name: Report the verified release
+  ansible.builtin.debug:
+    msg: '{{ inventory_hostname }}: {{ checked_ref }} | {{ checked_id }} | {{ checked_versions[0] }}'
