@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Controller-side entry point. Run as labadmin, not sudo.
+# this bash script is created by AI, it will coordinate the deployment, auto rollback and evidence collection 
 # Examples:
 # bash tools/rollout.sh deploy localhost/opsportal:manual2 ~/opsportal-manual2.tar manual2
 # bash tools/rollout.sh rollback
