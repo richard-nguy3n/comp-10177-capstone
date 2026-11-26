@@ -1,5 +1,6 @@
 name: Capstone deployment
-
+# this script is created by Richard and AI supported with get the project  code 
+# tag and reuse and tested deployment
 # Run after a push to master, or start manually from GitHub.
 on:
   push:
@@ -9,13 +10,13 @@ on:
 permissions:
   contents: read
 
-# Allow only one deployment at a time.
+# Allow only one deployment at a time. Deploy APP01 then APP02 
 concurrency:
   group: capstone-deployment
   cancel-in-progress: false
-
+# Define the job  in this workflow 
 jobs:
-  deploy:
+  deploy:    # name this job as deploy 
     runs-on: [self-hosted, linux, x64, capstone]
     timeout-minutes: 30
 
@@ -33,7 +34,7 @@ jobs:
             --build-arg APP_VERSION="$GITHUB_SHA" \
             -t "localhost/opsportal:$GITHUB_SHA" .
 
-      # Test before allowing deployment.
+      # Test before allowing deployment , this part is assisted by AI 
       - name: Test portal code
         run: |
           podman run --rm \
