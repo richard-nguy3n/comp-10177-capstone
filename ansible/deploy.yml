@@ -1,11 +1,14 @@
 ---
 # Preflight changes no running service. Snapshot rollback references only after
 # BOTH nodes are verified and the controller's new image/archive are available.
+
+# # Check both app servers and save their current configuration for rollback.
 - name: Verify the starting state and preserve rollback configuration
   hosts: apps
   become: true
   any_errors_fatal: true
   tasks:
+  # this task is ensure all required deployment inputs are provided.
     - name: Require deployment inputs
       ansible.builtin.assert:
         that:
@@ -14,29 +17,29 @@
           - release_version is defined
           - transaction_marker is defined
       run_once: true
-
+## Read the current accepted image reference.
     - name: Read accepted image reference
       ansible.builtin.slurp:
         src: /etc/opsportal/image
       register: accepted_ref
-
+# Verify the current release using shared verification tasks.
     - name: Verify the currently accepted release
       ansible.builtin.include_tasks: tasks/verify_release.yml
       vars:
         verify_ref: '{{ accepted_ref.content | b64decode | trim }}'
-
+# Remember the starting image reference, ID, and version.
     - name: Remember transaction-start identity
       ansible.builtin.set_fact:
         start_ref: '{{ checked_ref }}'
         start_id: '{{ checked_id }}'
         start_version: '{{ checked_versions[0] }}'
-
+# Read the current container configuration without exposing secrets.
     - name: Read the original Quadlet privately
       ansible.builtin.slurp:
         src: /etc/containers/systemd/opsportal.container
       register: original_unit
       no_log: true
-
+# Ensure the container configuration matches the accepted image.
     - name: Require one Image line matching the accepted image
       ansible.builtin.assert:
         that:
@@ -45,7 +48,7 @@
               | regex_findall('(?m)^Image=(.+)$') | map('trim') | list)
             == [start_ref]
       no_log: true
-
+# Require matching starting releases and a different deployment image tag.
     - name: Require identical healthy starting releases on both apps
       ansible.builtin.assert:
         that:
@@ -55,7 +58,7 @@
           - image_ref != start_ref
         fail_msg: Both nodes must start on one identical release; use a new image tag.
       run_once: true
-
+# Check the image archive on MGMT01.
     - name: Check the new archive on MGMT01
       ansible.builtin.stat:
         path: '{{ image_archive }}'
@@ -63,7 +66,7 @@
       delegate_to: localhost
       become: false
       run_once: true
-
+# Ensure the archive exists and is a nonempty regular file.
     - name: Require a nonempty release archive
       ansible.builtin.assert:
         that:
@@ -71,7 +74,7 @@
           - release_archive.stat.isreg
           - release_archive.stat.size > 0
       run_once: true
-
+# Inspect the new image on MGMT01 without sudo.
     - name: Inspect the controller image as the invoking user
       ansible.builtin.command:
         argv: [podman, image, inspect, '{{ image_ref }}']
@@ -80,7 +83,7 @@
       delegate_to: localhost
       become: false
       run_once: true
-
+# Ensure the image contains the expected application version.
     - name: Validate the controller release version
       ansible.builtin.assert:
         that:
@@ -89,11 +92,11 @@
               | select('match', '^APP_VERSION=') | list)
             == ['APP_VERSION=' ~ release_version]
       run_once: true
-
+# Remember the expected new image ID for both servers.
     - name: Record expected new image identity on each host
       ansible.builtin.set_fact:
         release_id: '{{ (controller_image.stdout | from_json)[0].Id }}'
-
+# Verify trusted HTTPS health from MGMT01 before restarting.
     - name: Verify trusted portal health before any restart
       ansible.builtin.uri:
         url: https://portal.opsdemo.test/health
@@ -103,7 +106,7 @@
       delegate_to: localhost
       become: false
       run_once: true
-
+# Save the current container configuration for rollback.
     - name: Preserve previous Quadlet without changing the live file
       ansible.builtin.copy:
         content: '{{ original_unit.content | b64decode }}'
@@ -112,7 +115,7 @@
         group: root
         mode: '0600'
       no_log: true
-
+# Save the current container configuration for rollback.
     - name: Preserve previous image reference
       ansible.builtin.copy:
         content: '{{ accepted_ref.content | b64decode }}'
@@ -207,7 +210,7 @@
         - name: Reject the release and trigger whole-transaction rollback
           ansible.builtin.fail:
             msg: Release rejected. The wrapper will restore both transaction-start releases.
-
+# Run final release checks on MGMT01 without sudo or fact gathering. This have the assistance of AI 
 - name: Confirm the complete new release
   hosts: localhost
   gather_facts: false
